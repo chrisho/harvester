@@ -246,11 +246,12 @@ func (h *PromoteHandler) setPromoteResult(job *batchv1.Job, node *corev1.Node, s
 // If the cluster doesn't need to be promoted, return nil
 func selectPromoteNode(nodeList []*corev1.Node) *corev1.Node {
 	var (
-		promoteNode                             *corev1.Node
-		healthyHarvesterWorkers                 []*corev1.Node
-		managementOrHealthyHarvesterWorkerZones = make(map[string]bool)
-		managementZones                         = make(map[string]bool)
-		managementNumber                        int
+		promoteNode             *corev1.Node
+		healthyHarvesterWorkers []*corev1.Node
+		managementNumber        int
+
+		appendNode func(node *corev1.Node, zone string, isManagement bool)
+		pnz        func() *corev1.Node
 	)
 
 	nodeNumber := len(nodeList)
@@ -282,47 +283,91 @@ func selectPromoteNode(nodeList []*corev1.Node) *corev1.Node {
 			return nil
 		}
 
-		zone := node.Labels[corev1.LabelTopologyZone]
-		if isManagement {
-			if zone != "" {
-				managementZones[zone] = true
-				managementOrHealthyHarvesterWorkerZones[zone] = true
-			}
-		} else if isHealthyNode(node) && isHarvesterNode(node) {
-			if zone != "" {
-				managementOrHealthyHarvesterWorkerZones[zone] = true
-			}
-			healthyHarvesterWorkers = append(healthyHarvesterWorkers, node)
-		} else {
+		if !isManagement &&
+			(!isHealthyNode(node) || !isHarvesterNode(node)) {
+
 			canBeManagementNodeCount--
+			continue
 		}
 
 		// return if there are no enough nodes can be management node
 		if canBeManagementNodeCount < defaultSpecManagementNumber {
 			return nil
 		}
-	}
 
-	// return if there are no enough zones
-	hasZones := len(managementZones) > 0
-	hasEnoughZones := len(managementOrHealthyHarvesterWorkerZones) >= defaultSpecManagementNumber
-	if hasZones && !hasEnoughZones {
-		return nil
-	}
-
-	promoteNode = nil
-	for _, node := range healthyHarvesterWorkers {
 		zone := node.Labels[corev1.LabelTopologyZone]
-		hasNewZone := zone != "" && !managementZones[zone]
-		if !hasZones || hasNewZone {
-			if promoteNode == nil || node.CreationTimestamp.Before(&promoteNode.CreationTimestamp) {
-				promoteNode = node
+		if zone != "" {
+			// for zone
+
+			if appendNode == nil {
+				appendNode, pnz = promoteNodeForZone(healthyHarvesterWorkers)
 			}
+			appendNode(node, zone, isManagement)
+		} else if !isManagement {
+			// for general nodes
+
+			healthyHarvesterWorkers = append(healthyHarvesterWorkers, node)
 		}
+	}
+
+	// handling zone nodes
+	if pnz != nil {
+		return pnz()
+	}
+
+	for _, node := range healthyHarvesterWorkers {
+		compareAndSwapNode(&promoteNode, node)
 	}
 
 	// promote the oldest node
 	return promoteNode
+}
+
+// promoteNodeForZone return appendNode closure for append node for zone, and return promote node closure
+func promoteNodeForZone(readyNodes []*corev1.Node) (
+	func(node *corev1.Node, zone string, isManagement bool),
+	func() *corev1.Node,
+) {
+
+	var (
+		managementZones                         = make(map[string]bool)
+		managementOrHealthyHarvesterWorkerZones = make(map[string]bool)
+	)
+
+	appendNode := func(node *corev1.Node, zone string, isManagement bool) {
+		managementOrHealthyHarvesterWorkerZones[zone] = true
+		if _, ok := managementZones[zone]; ok {
+			return
+		}
+
+		if isManagement {
+			managementZones[zone] = true
+			return
+		}
+
+		readyNodes = append(readyNodes, node)
+	}
+
+	return appendNode, func() *corev1.Node {
+		if !(len(managementOrHealthyHarvesterWorkerZones) >= defaultSpecManagementNumber) {
+			return nil
+		}
+
+		var promoteNode *corev1.Node
+		for _, node := range readyNodes {
+			if node.Labels[corev1.LabelTopologyZone] != "" {
+				compareAndSwapNode(&promoteNode, node)
+			}
+		}
+		return promoteNode
+	}
+}
+
+// compareAndSwapNode compare node's create time, swap the older one
+func compareAndSwapNode(promoteNode **corev1.Node, node *corev1.Node) {
+	if *promoteNode == nil || node.CreationTimestamp.Before(&(*(promoteNode)).CreationTimestamp) {
+		*promoteNode = node
+	}
 }
 
 // isHealthyNode determine whether it's an healthy node
