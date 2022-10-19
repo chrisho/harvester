@@ -5,6 +5,8 @@ import (
 	"text/template"
 
 	"github.com/pkg/errors"
+	ctlcorev1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/yaml"
 
@@ -14,11 +16,17 @@ import (
 )
 
 var (
+	userdataTmpl        = template.Must(template.New("userdata").Parse(initBaseUserdatas))
 	templateTmpl        = template.Must(template.New("template").Parse(initBaseTemplates))
 	templateVersionTmpl = template.Must(template.New("templateVersion").Parse(initBaseTemplateVersions))
 )
 
 func createTemplates(mgmt *config.Management, namespace string) error {
+	secrets := mgmt.CoreFactory.Core().V1().Secret()
+	if err := initBaseUserdata(secrets, namespace); err != nil {
+		return err
+	}
+
 	templates := mgmt.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineTemplate()
 	templateVersions := mgmt.HarvesterFactory.Harvesterhci().V1beta1().VirtualMachineTemplateVersion()
 	if err := initBaseTemplate(templates, namespace); err != nil {
@@ -39,6 +47,25 @@ func generateYmls(tmpl *template.Template, namespace string) ([][]byte, error) {
 	}
 
 	return bytes.Split(templateBuffer.Bytes(), []byte("\n---\n")), nil
+}
+
+func initBaseUserdata(secretClient ctlcorev1.SecretClient, namespace string) error {
+	ymls, err := generateYmls(userdataTmpl, namespace)
+	if err != nil {
+		return err
+	}
+
+	for _, yml := range ymls {
+		var secret corev1.Secret
+		if err := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(yml), 1024).Decode(&secret); err != nil {
+			return errors.Wrap(err, "Failed to convert Secret from yaml to object")
+		}
+
+		if _, err := secretClient.Create(&secret); err != nil && !apierrors.IsAlreadyExists(err) {
+			return errors.Wrapf(err, "Failed to create Secret %s/%s", secret.Namespace, secret.Name)
+		}
+	}
+	return nil
 }
 
 func initBaseTemplate(vmTemplates ctlharvesterv1.VirtualMachineTemplateClient, namespace string) error {
@@ -80,6 +107,32 @@ func initBaseTemplateVersion(vmTemplateVersions ctlharvesterv1.VirtualMachineTem
 }
 
 var (
+	initBaseUserdatas = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: iso-image-template-userdata
+  namespace: {{ .Namespace }}
+  labels:
+    harvesterhci.io/cloud-init-template: harvester
+type: secret
+data:
+  networkdata: ""
+  userdata: I2Nsb3VkLWNvbmZpZwpwYWNrYWdlX3VwZGF0ZTogdHJ1ZQpwYWNrYWdlczoKICAtIHFlbXUtZ3Vlc3QtYWdlbnQKcnVuY21kOgogIC0gLSBzeXN0ZW1jdGwKICAgIC0gZW5hYmxlCiAgICAtIC0tbm93CiAgICAtIHFlbXUtZ3Vlc3QtYWdlbnQuc2VydmljZQo=
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: raw-image-template-userdata
+  namespace: {{ .Namespace }}
+  labels:
+    harvesterhci.io/cloud-init-template: harvester
+type: secret
+data:
+  networkdata: ""
+  userdata: I2Nsb3VkLWNvbmZpZwpwYWNrYWdlX3VwZGF0ZTogdHJ1ZQpwYWNrYWdlczoKICAtIHFlbXUtZ3Vlc3QtYWdlbnQKcnVuY21kOgogIC0gLSBzeXN0ZW1jdGwKICAgIC0gZW5hYmxlCiAgICAtIC0tbm93CiAgICAtIHFlbXUtZ3Vlc3QtYWdlbnQuc2VydmljZQo=
+`
+
 	initBaseTemplates = `
 apiVersion: harvesterhci.io/v1beta1
 kind: VirtualMachineTemplate
@@ -200,16 +253,8 @@ spec:
             name: rootdisk
           - name: cloudinitdisk
             cloudInitNoCloud:
-                userData: |
-                  #cloud-config
-                  package_update: true
-                  packages:
-                    - qemu-guest-agent
-                  runcmd:
-                    - - systemctl
-                      - enable
-                      - --now
-                      - qemu-guest-agent.service
+              secretRef:
+                name: iso-image-template-userdata
 ---
 apiVersion: harvesterhci.io/v1beta1
 kind: VirtualMachineTemplateVersion
@@ -273,16 +318,8 @@ spec:
             name: rootdisk
           - name: cloudinitdisk
             cloudInitNoCloud:
-                userData: |
-                  #cloud-config
-                  package_update: true
-                  packages:
-                    - qemu-guest-agent
-                  runcmd:
-                    - - systemctl
-                      - enable
-                      - --now
-                      - qemu-guest-agent.service
+              secretRef:
+                name: raw-image-template-userdata
 ---
 apiVersion: harvesterhci.io/v1beta1
 kind: VirtualMachineTemplateVersion
